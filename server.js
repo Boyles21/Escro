@@ -10,7 +10,7 @@ app.use(express.json());
 // 1. HEALTH CHECK ROUTE
 // ==========================================
 app.get('/', (req, res) => {
-    res.send('TrustDM Sandbox Engine is running smoothly!');
+    res.send('Escro Sandbox Engine is running smoothly!');
 });
 
 // ==========================================
