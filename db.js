@@ -23,7 +23,16 @@ const connectionConfig = process.env.DATABASE_URL
         port: Number(process.env.DB_PORT || 5432)
     };
 
-const pool = new Pool(connectionConfig);
+console.log('Database diagnostic:', {
+    nodeEnv: process.env.NODE_ENV,
+    hasDatabaseUrl: Boolean(process.env.DATABASE_URL),
+    databaseUrlProtocol: process.env.DATABASE_URL
+        ? process.env.DATABASE_URL.split('://')[0]
+        : null,
+    databaseHost: connectionConfig.host || 'from connection string'
+});
+    const pool = new Pool(connectionConfig);
+
 
 pool.on('error', (err) => {
     console.error('Unexpected PostgreSQL pool error:', err.message);
