@@ -10,8 +10,13 @@ const pool = require('./db.js');
 const cron = require('node-cron');
 
 const app = express();
-app.use(express.json());
 
+app.use((req, res, next) => {
+  console.log(`[Request] ${req.method} ${req.originalUrl}`);
+  next();
+});
+
+app.use(express.json());
 // ==========================================
 // 1. HEALTH CHECK ROUTE
 // ==========================================
