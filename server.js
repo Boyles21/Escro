@@ -1,3 +1,8 @@
+console.log('ESCRO SERVER BUILD CHECK: 2026-10-16-A');
+console.log('DATABASE_URL present:', Boolean(process.env.DATABASE_URL));
+console.log('NODE_ENV:', process.env.NODE_ENV);
+
+
 const express = require('express');
 const pool = require('./db.js'); // Import our actual database pool connection
 const cron = require('node-cron');
