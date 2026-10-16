@@ -19,6 +19,25 @@ app.get('/', (req, res) => {
     res.send('Escrow Bot Sandbox Engine is running smoothly!');
 });
 
+app.get('/health/db', async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT NOW() AS database_time'
+        );
+
+        res.status(200).json({
+            status: 'connected',
+            database_time: result.rows[0].database_time
+        });
+    } catch (error) {
+        console.error('Database health check failed:', error.message);
+
+        res.status(503).json({
+            status: 'disconnected',
+            error: 'Database connection failed'
+        });
+    }
+});
 // ==========================================
 // 2. INITIATE TRANSACTION
 // ==========================================
