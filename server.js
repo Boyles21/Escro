@@ -168,6 +168,26 @@ app.post('/api/webhook/instagram', async (req, res) => {
     try {
         const body = req.body;
 
+        console.log('[Instagram] Webhook object:', body?.object);
+console.log(
+    '[Instagram] Entry count:',
+    Array.isArray(body?.entry) ? body.entry.length : 'not an array'
+);
+
+if (Array.isArray(body?.entry)) {
+    for (const entry of body.entry) {
+        console.log(
+            '[Instagram] Entry fields:',
+            Object.keys(entry || {})
+        );
+
+        console.log(
+            '[Instagram] Messaging events:',
+            Array.isArray(entry?.messaging) ? entry.messaging.length : 'not an array'
+        );
+    }
+}
+
         if (body?.object !== 'instagram' || !Array.isArray(body.entry)) {
             return res.status(404).send('Not an Instagram event');
         }
