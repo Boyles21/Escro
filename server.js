@@ -1,7 +1,6 @@
-
 require('dotenv').config();
 
-console.log('ESCRO SERVER BUILD CHECK: 2026-10-16-B');
+console.log('ESCRO SERVER BUILD CHECK: 2026-10-16-C');
 console.log('DATABASE_URL present:', Boolean(process.env.DATABASE_URL));
 console.log('NODE_ENV:', process.env.NODE_ENV);
 
@@ -10,406 +9,377 @@ const pool = require('./db.js');
 const cron = require('node-cron');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
+// Safe request logging. Never log secrets or full request bodies.
 app.use((req, res, next) => {
   console.log(`[Request] ${req.method} ${req.originalUrl}`);
   next();
 });
 
-app.use(express.json());
-// ==========================================
-// 1. HEALTH CHECK ROUTE
-// ==========================================
+app.use(express.json({ limit: '1mb' }));
+
+// Home route
 app.get('/', (req, res) => {
-    res.send('Escrow Bot Sandbox Engine is running smoothly!');
+  res.status(200).json({
+    status: 'ok',
+    service: 'Escro API'
+  });
 });
 
+// Database health check
 app.get('/health/db', async (req, res) => {
-    try {
-        const result = await pool.query(
-            'SELECT NOW() AS database_time'
-        );
+  try {
+    const result = await pool.query('SELECT NOW() AS database_time');
 
-        res.status(200).json({
-            status: 'connected',
-            database_time: result.rows[0].database_time
-        });
-    } catch (error) {
-        console.error('Database health check failed:', error.message);
+    res.status(200).json({
+      status: 'connected',
+      database_time: result.rows[0].database_time
+    });
+  } catch (error) {
+    console.error('[Database] Health check failed:', error.message);
 
-        res.status(503).json({
-            status: 'disconnected',
-            error: 'Database connection failed'
-        });
-    }
+    res.status(500).json({
+      status: 'error',
+      message: 'Database connection failed'
+    });
+  }
 });
-// ==========================================
-// 2. INITIATE TRANSACTION
-// ==========================================
+
+// Demo transaction creation endpoint
 app.post('/api/transactions/initiate', async (req, res) => {
-    try {
-        const {
-            buyer_username,
-            seller_username,
-            amount,
-            buyer_email
-        } = req.body;
-
-        if (
-            !buyer_username ||
-            !seller_username ||
-            !amount ||
-            !buyer_email ||
-            !Number.isFinite(Number(amount)) ||
-            Number(amount) <= 0
-        ) {
-            return res.status(400).json({
-                error: 'Valid buyer, seller, amount and email are required.'
-            });
-        }
-
-        const buyerRes = await pool.query(
-            `INSERT INTO users (username)
-             VALUES ($1)
-             ON CONFLICT (username)
-             DO UPDATE SET username = EXCLUDED.username
-             RETURNING id`,
-            [buyer_username]
-        );
-
-        const sellerRes = await pool.query(
-            `INSERT INTO users (username)
-             VALUES ($1)
-             ON CONFLICT (username)
-             DO UPDATE SET username = EXCLUDED.username
-             RETURNING id`,
-            [seller_username]
-        );
-
-        const buyerId = buyerRes.rows[0].id;
-        const sellerId = sellerRes.rows[0].id;
-
-        // Sandbox PIN generation only. Use a cryptographically secure
-        // generator and protected PIN storage before production use.
-        const deliveryPin = String(
-            Math.floor(1000 + Math.random() * 9000)
-        );
-
-        const automatedReleaseAt = new Date(
-            Date.now() + 48 * 60 * 60 * 1000
-        );
-
-        const transactionRes = await pool.query(
-            `INSERT INTO transactions
-             (buyer_id, seller_id, amount, escrow_status,
-              delivery_pin, automated_release_at)
-             VALUES ($1, $2, $3, 'PENDING', $4, $5)
-             RETURNING id`,
-            [
-                buyerId,
-                sellerId,
-                Number(amount),
-                deliveryPin,
-                automatedReleaseAt
-            ]
-        );
-
-        const transactionId = transactionRes.rows[0].id;
-
-        // Placeholder only. This is NOT a real Paystack checkout URL.
-        const simulatedCheckoutUrl =
-            `https://paystack.com/${transactionId}`;
-
-        return res.status(201).json({
-            message: '[SANDBOX ACTIVE] Escrow record registered successfully.',
-            transaction_id: transactionId,
-            status: 'PENDING',
-            payment_url: simulatedCheckoutUrl,
-            verification_pin: deliveryPin,
-            auto_release_time: automatedReleaseAt
-        });
-    } catch (error) {
-        console.error('Initialization Error:', error.message);
-        return res.status(500).json({
-            error: 'Unable to initialize transaction.'
-        });
-    }
-});
-
-// ==========================================
-// 3A. INSTAGRAM WEBHOOK VERIFICATION
-// ==========================================
-app.get('/api/webhook/instagram', (req, res) => {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
-
-    const verifyToken = process.env.INSTAGRAM_VERIFY_TOKEN;
+  try {
+    const { buyer_id, seller_id, amount, description } = req.body || {};
+    const numericAmount = Number(amount);
 
     if (
-        mode === 'subscribe' &&
-        verifyToken &&
-        token === verifyToken &&
-        challenge
+      !buyer_id ||
+      !seller_id ||
+      !Number.isFinite(numericAmount) ||
+      numericAmount <= 0
     ) {
-        console.log('[Instagram] Webhook verification successful.');
-        return res.status(200).send(challenge);
+      return res.status(400).json({
+        error: 'buyer_id, seller_id, and a positive amount are required'
+      });
     }
 
-    return res.status(403).send('Verification failed');
+    const verificationPin = String(
+      Math.floor(1000 + Math.random() * 9000)
+    );
+
+    const result = await pool.query(
+      `INSERT INTO transactions
+       (buyer_id, seller_id, amount, description, status,
+        verification_pin, created_at)
+       VALUES ($1, $2, $3, $4, 'PENDING', $5, NOW())
+       RETURNING id, buyer_id, seller_id, amount,
+                 description, status, created_at`,
+      [
+        buyer_id,
+        seller_id,
+        numericAmount,
+        description || null,
+        verificationPin
+      ]
+    );
+
+    // Demo only. Do not expose PINs this way in production.
+    return res.status(201).json({
+      message:
+        'Transaction created. Payment integration must be completed before using real funds.',
+      transaction: result.rows[0],
+      verification_pin: verificationPin
+    });
+  } catch (error) {
+    console.error('[Transactions] Initiation failed:', error.message);
+
+    return res.status(500).json({
+      error: 'Could not initiate transaction'
+    });
+  }
 });
 
-// ==========================================
-// 3B. INSTAGRAM WEBHOOK MESSAGE HANDLER
-// ==========================================
+// Instagram webhook verification
+app.get('/api/webhook/instagram', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  const expectedToken = process.env.INSTAGRAM_VERIFY_TOKEN;
+
+  if (
+    mode === 'subscribe' &&
+    expectedToken &&
+    token === expectedToken
+  ) {
+    console.log('[Instagram] Webhook verification successful.');
+    return res.status(200).send(challenge);
+  }
+
+  console.warn('[Instagram] Webhook verification failed.');
+  return res.sendStatus(403);
+});
+
+// Instagram webhook event handler
 app.post('/api/webhook/instagram', async (req, res) => {
-    // Acknowledge the webhook payload. This endpoint does not itself
-    // send a reply DM; that requires an authenticated Instagram API call.
-    try {
-        const body = req.body;
+  try {
+    const body = req.body;
 
-        console.log('[Instagram] Webhook object:', body?.object);
-console.log(
-    '[Instagram] Entry count:',
-    Array.isArray(body?.entry) ? body.entry.length : 'not an array'
-);
+    console.log(
+      '[Instagram] Webhook object:',
+      body?.object || 'missing'
+    );
 
-if (Array.isArray(body?.entry)) {
+    if (
+      body?.object !== 'instagram' ||
+      !Array.isArray(body.entry)
+    ) {
+      console.warn('[Instagram] Invalid webhook payload received.');
+      return res.status(400).send('Invalid Instagram webhook payload');
+    }
+
+    console.log('[Instagram] Entry count:', body.entry.length);
+
     for (const entry of body.entry) {
+      console.log(
+        '[Instagram] Entry fields:',
+        Object.keys(entry || {})
+      );
+
+      // Actual messaging events commonly arrive here.
+      if (Array.isArray(entry.messaging)) {
         console.log(
-            '[Instagram] Entry fields:',
-            Object.keys(entry || {})
+          '[Instagram] Messaging event count:',
+          entry.messaging.length
         );
 
-        console.log(
-            '[Instagram] Messaging events:',
-            Array.isArray(entry?.messaging) ? entry.messaging.length : 'not an array'
-        );
-    }
-}
+        for (const event of entry.messaging) {
+          if (!event || !event.message || event.message.is_echo) {
+            continue;
+          }
 
-        if (body?.object !== 'instagram' || !Array.isArray(body.entry)) {
-            return res.status(404).send('Not an Instagram event');
-        }
+          const senderId = event.sender?.id;
 
-        for (const entry of body.entry) {
-            if (!Array.isArray(entry.messaging)) continue;
+          const messageText =
+            typeof event.message.text === 'string'
+              ? event.message.text.trim()
+              : '';
 
-            for (const event of entry.messaging) {
-                if (!event.message || event.message.is_echo) continue;
-
-                const senderId = event.sender?.id;
-                const messageText = event.message.text?.trim() || '';
-
-                if (!senderId || !messageText) continue;
-
-                console.log(
-                    `[Instagram] Incoming message from sender ${senderId}`
-                );
-
-                const parts = messageText.split(/\s+/);
-
-                if (parts[0].toLowerCase() !== 'verify') continue;
-
-                const transactionId = parts[1];
-                const inputPin = parts[2];
-
-                if (!transactionId || !inputPin) {
-                    console.log(
-                        '[Instagram] Verification command is incomplete.'
-                    );
-                    continue;
-                }
-
-                const txRes = await pool.query(
-                    `SELECT id, escrow_status, delivery_pin
-                     FROM transactions
-                     WHERE id = $1`,
-                    [transactionId]
-                );
-
-                if (txRes.rows.length === 0) {
-                    console.log('[Instagram] Transaction not found.');
-                    continue;
-                }
-
-                const transaction = txRes.rows[0];
-
-                if (transaction.escrow_status !== 'FUNDS_HELD') {
-                    console.log(
-                        `[Instagram] Transaction status: ${transaction.escrow_status}`
-                    );
-                    continue;
-                }
-
-                if (String(transaction.delivery_pin) !== inputPin) {
-                    console.log('[Instagram] Incorrect delivery PIN.');
-                    continue;
-                }
-
-                // Atomic conditional update prevents completing a
-                // transaction that has already changed state.
-                const updateRes = await pool.query(
-                    `UPDATE transactions
-                     SET escrow_status = 'COMPLETED'
-                     WHERE id = $1
-                       AND escrow_status = 'FUNDS_HELD'
-                       AND delivery_pin = $2
-                     RETURNING id`,
-                    [transactionId, inputPin]
-                );
-
-                if (updateRes.rowCount === 1) {
-                    console.log(
-                        `[Instagram] Transaction ${transactionId} marked COMPLETED.`
-                    );
-                } else {
-                    console.log(
-                        '[Instagram] Transaction changed before verification completed.'
-                    );
-                }
+          console.log(
+            '[Instagram] Incoming messaging event received.',
+            {
+              hasSenderId: Boolean(senderId),
+              hasText: Boolean(messageText),
+              messageType: event.message?.attachments?.length
+                ? 'attachment'
+                : 'text'
             }
-        }
+          );
 
-        return res.status(200).send('EVENT_RECEIVED');
-    } catch (error) {
-        console.error(
-            'Instagram webhook error:',
-            error.message,
-            error.code || ''
-        );
+          if (!senderId || !messageText) {
+            continue;
+          }
 
-        return res.status(500).json({
-            error: 'Instagram webhook processing failed.'
-        });
-    }
-});
+          // Demo command: verify <transactionId> <4-digit PIN>
+          const match = messageText.match(
+            /^verify\s+(\S+)\s+(\d{4})$/i
+          );
 
-// ==========================================
-// 4. MANUAL DELIVERY PIN VERIFICATION
-// ==========================================
-app.post('/api/transactions/verify-pin', async (req, res) => {
-    try {
-        const { transaction_id, delivery_pin } = req.body;
-
-        if (!transaction_id || !delivery_pin) {
-            return res.status(400).json({
-                error: 'transaction_id and delivery_pin are required.'
-            });
-        }
-
-        const updateRes = await pool.query(
-            `UPDATE transactions
-             SET escrow_status = 'COMPLETED'
-             WHERE id = $1
-               AND escrow_status = 'FUNDS_HELD'
-               AND delivery_pin = $2
-             RETURNING id`,
-            [transaction_id, String(delivery_pin)]
-        );
-
-        if (updateRes.rowCount === 0) {
-            return res.status(400).json({
-                error: 'Transaction not found, PIN incorrect, or funds not held.'
-            });
-        }
-
-        return res.status(200).json({
-            status: 'success',
-            message: 'Delivery PIN verified; transaction marked completed.'
-        });
-    } catch (error) {
-        console.error('PIN verification error:', error.message, error.code || '');
-
-        return res.status(500).json({
-            error: 'PIN verification failed.'
-        });
-    }
-});
-
-// ==========================================
-// 5. PAYSTACK WEBHOOK
-// ==========================================
-// IMPORTANT: Before production, verify the Paystack signature using the
-// raw request body and validate transaction ID, amount and currency.
-// Do not treat an unverified webhook as proof of payment.
-app.post('/api/payment/webhook', async (req, res) => {
-    try {
-        const event = req.body;
-
-        if (event?.event !== 'charge.success') {
-            return res.status(200).json({
-                message: 'Event received and ignored.'
-            });
-        }
-
-        const transactionId = event.data?.metadata?.transaction_id;
-
-        if (!transactionId) {
-            console.error('[Paystack] Missing transaction_id metadata.');
-            return res.status(400).json({
-                error: 'Missing transaction metadata.'
-            });
-        }
-
-        const updateRes = await pool.query(
-            `UPDATE transactions
-             SET escrow_status = 'FUNDS_HELD'
-             WHERE id = $1
-               AND escrow_status = 'PENDING'
-             RETURNING id`,
-            [transactionId]
-        );
-
-        return res.status(200).json({
-            status: 'received',
-            updated: updateRes.rowCount === 1
-        });
-    } catch (error) {
-        console.error('Payment webhook error:', error.message, error.code || '');
-
-        return res.status(500).json({
-            error: 'Payment webhook processing failed.'
-        });
-    }
-});
-
-// ==========================================
-// 6. AUTOMATED RELEASE TIMER
-// ==========================================
-// This updates a database status only. It does not transfer or pay out
-// money. Add dispute checks and a real, verified payout workflow before
-// using this with actual transactions.
-cron.schedule('0 * * * *', async () => {
-    try {
-        const result = await pool.query(
-            `UPDATE transactions
-             SET escrow_status = 'FORCE_RELEASED'
-             WHERE escrow_status = 'FUNDS_HELD'
-               AND automated_release_at <= NOW()
-             RETURNING id`
-        );
-
-        if (result.rowCount > 0) {
+          if (!match) {
             console.log(
-                `[Cron] ${result.rowCount} transaction(s) marked FORCE_RELEASED.`
+              '[Instagram] Message did not match the verification command.'
             );
+            continue;
+          }
+
+          const transactionId = match[1];
+          const suppliedPin = match[2];
+
+          const transactionResult = await pool.query(
+            `SELECT id, status, verification_pin
+             FROM transactions
+             WHERE id::text = $1
+             LIMIT 1`,
+            [transactionId]
+          );
+
+          if (transactionResult.rowCount === 0) {
+            console.log(
+              '[Instagram] Verification failed: transaction not found.'
+            );
+            continue;
+          }
+
+          const transaction = transactionResult.rows[0];
+
+          if (
+            transaction.status !== 'FUNDS_HELD' ||
+            String(transaction.verification_pin) !== suppliedPin
+          ) {
+            console.log(
+              '[Instagram] Verification failed: status or PIN did not match.'
+            );
+            continue;
+          }
+
+          // Conditional update prevents completing a transaction
+          // that is no longer in FUNDS_HELD status.
+          const updateResult = await pool.query(
+            `UPDATE transactions
+             SET status = 'COMPLETED',
+                 completed_at = NOW()
+             WHERE id::text = $1
+               AND status = 'FUNDS_HELD'
+               AND verification_pin::text = $2
+             RETURNING id`,
+            [transactionId, suppliedPin]
+          );
+
+          if (updateResult.rowCount === 1) {
+            console.log(
+              '[Instagram] Transaction verification completed:',
+              transactionId
+            );
+          } else {
+            console.log(
+              '[Instagram] Transaction status changed before verification could complete.'
+            );
+          }
         }
-    } catch (error) {
-        console.error(
-            'Cron Job Failure:',
-            error.message,
-            'code:',
-            error.code || 'unknown'
+      } else {
+        console.log('[Instagram] Messaging events: not an array');
+      }
+
+      // Meta's Test button may send a changes payload.
+      // Log its structure without logging private message content.
+      if (Array.isArray(entry.changes)) {
+        console.log(
+          '[Instagram] Change event count:',
+          entry.changes.length
         );
+
+        for (const change of entry.changes) {
+          console.log('[Instagram] Change event received:', {
+            field: change?.field || 'unknown',
+            valueKeys:
+              change?.value && typeof change.value === 'object'
+                ? Object.keys(change.value)
+                : []
+          });
+        }
+      }
     }
+
+    return res.status(200).send('EVENT_RECEIVED');
+  } catch (error) {
+    console.error(
+      '[Instagram] Webhook handler failed:',
+      error.message
+    );
+
+    return res.status(500).send('Webhook handler error');
+  }
 });
 
-// ==========================================
-// 7. SERVER INITIALIZATION
-// ==========================================
-const PORT = process.env.PORT || 5000;
+// Paystack webhook placeholder.
+// Does not mark payments as paid without verification.
+app.post('/api/payment/webhook', async (req, res) => {
+  try {
+    const event = req.body;
 
+    if (
+      event?.event !== 'charge.success' ||
+      !event?.data?.reference
+    ) {
+      return res.status(200).send('EVENT_RECEIVED');
+    }
+
+    console.warn(
+      '[Paystack] Sandbox placeholder received a charge.success event. Signature and payment details are not verified.'
+    );
+
+    return res.status(200).send('EVENT_RECEIVED');
+  } catch (error) {
+    console.error(
+      '[Paystack] Webhook handler failed:',
+      error.message
+    );
+
+    return res.status(500).send('Webhook handler error');
+  }
+});
+
+// Demo-only PIN verification endpoint.
+// Authentication and authorization are required before production.
+app.post('/api/transactions/verify-pin', async (req, res) => {
+  try {
+    const { transaction_id, pin } = req.body || {};
+
+    if (!transaction_id || !pin) {
+      return res.status(400).json({
+        error: 'transaction_id and pin are required'
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE transactions
+       SET status = 'COMPLETED',
+           completed_at = NOW()
+       WHERE id::text = $1
+         AND verification_pin::text = $2
+         AND status = 'FUNDS_HELD'
+       RETURNING id, status, completed_at`,
+      [String(transaction_id), String(pin)]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(400).json({
+        error:
+          'Transaction not found, PIN invalid, or funds are not held'
+      });
+    }
+
+    return res.status(200).json({
+      message: 'Verification successful',
+      transaction: result.rows[0]
+    });
+  } catch (error) {
+    console.error(
+      '[Transactions] PIN verification failed:',
+      error.message
+    );
+
+    return res.status(500).json({
+      error: 'Could not verify transaction PIN'
+    });
+  }
+});
+
+// Demo-only scheduled release.
+// This changes database status only. It does not transfer money.
+cron.schedule('0 * * * *', async () => {
+  try {
+    const result = await pool.query(
+      `UPDATE transactions
+       SET status = 'FORCE_RELEASED'
+       WHERE status = 'FUNDS_HELD'
+         AND created_at < NOW() - INTERVAL '7 days'
+       RETURNING id`
+    );
+
+    if (result.rowCount > 0) {
+      console.log(
+        `[Cron] Marked ${result.rowCount} expired transaction(s) FORCE_RELEASED (database status only).`
+      );
+    }
+  } catch (error) {
+    console.error(
+      '[Cron] Expired transaction check failed:',
+      error.message
+    );
+  }
+});
+
+// Start server
 app.listen(PORT, () => {
-    console.log(`Server is running successfully on port ${PORT}`);
+  console.log(`Escro server listening on port ${PORT}`);
 });
