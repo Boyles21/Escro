@@ -1,28 +1,32 @@
+
 const { Pool } = require('pg');
 require('dotenv').config();
 
-// Create a flexible connection configuration
-let connectionConfig = {};
+const isProduction = process.env.NODE_ENV === 'production';
 
-if (process.env.DATABASE_URL) {
-    // Production Path: If running on Render, use the Neon Cloud Connection String directly
-    connectionConfig = {
+if (isProduction && !process.env.DATABASE_URL) {
+    throw new Error(
+        'DATABASE_URL is missing from the production environment.'
+    );
+}
+
+const connectionConfig = process.env.DATABASE_URL
+    ? {
         connectionString: process.env.DATABASE_URL,
-        ssl: {
-            rejectUnauthorized: false // Required by Neon to handle secure cloud queries safely
-        }
-    };
-} else {
-    // Local Path: If running on your home PC, use your local .env pgAdmin parameters
-    connectionConfig = {
+        ssl: { rejectUnauthorized: false }
+    }
+    : {
         user: process.env.DB_USER,
         host: process.env.DB_HOST,
         database: process.env.DB_NAME,
         password: process.env.DB_PASSWORD,
-        port: process.env.DB_PORT,
+        port: Number(process.env.DB_PORT || 5432)
     };
-}
 
 const pool = new Pool(connectionConfig);
+
+pool.on('error', (err) => {
+    console.error('Unexpected PostgreSQL pool error:', err.message);
+});
 
 module.exports = pool;
