@@ -2,18 +2,24 @@
 require('dotenv').config();
 
 const crypto = require('crypto');
+const axios = require('axios');
 const express = require('express');
 const pool = require('./db.js');
 const cron = require('node-cron');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const SANDBOX_MODE = process.env.ESCRO_SANDBOX_MODE === 'true';
+const PIN_MAX_ATTEMPTS = 5;
+const PIN_LOCK_MINUTES = 15;
+const RELEASE_HOURS = 48;
 
-console.log('ESCRO SERVER BUILD CHECK: SCHEMA-FIX-2026-10-22');
+console.log('ESCRO SERVER BUILD CHECK: PAYMENT-SECURITY-2026-10-22');
 console.log('DATABASE_URL present:', Boolean(process.env.DATABASE_URL));
 console.log('NODE_ENV:', process.env.NODE_ENV || 'development');
+console.log('SANDBOX_MODE:', SANDBOX_MODE);
 
-// Preserve the original request bytes for Paystack signature verification.
+// Preserve raw request bytes for Paystack signature verification.
 app.use(express.json({
   limit: '1mb',
   verify: (req, res, buffer) => {
@@ -22,19 +28,26 @@ app.use(express.json({
 }));
 
 app.use((req, res, next) => {
-  console.log(`[Request] ${req.method} ${req.originalUrl}`);
+  console.log(`[Request] ${req.method} ${req.path}`);
   next();
 });
 
-// Homepage
+// --------------------------------------------------
+// HOMEPAGE
+// --------------------------------------------------
+
 app.get('/', (req, res) => {
   res.status(200).json({
     status: 'ok',
     service: 'Escro API',
+    mode: SANDBOX_MODE ? 'sandbox' : 'restricted',
   });
 });
 
-// Database health check
+// --------------------------------------------------
+// DATABASE HEALTH CHECK
+// --------------------------------------------------
+
 app.get('/health/db', async (req, res) => {
   try {
     const result = await pool.query('SELECT NOW() AS database_time');
@@ -53,76 +66,188 @@ app.get('/health/db', async (req, res) => {
   }
 });
 
-// Create a transaction in demo mode.
-// This does not collect or confirm payment.
+// --------------------------------------------------
+// CREATE TRANSACTION AND INITIALIZE PAYSTACK CHECKOUT
+// SANDBOX ONLY
+// --------------------------------------------------
+
 app.post('/api/transactions/initiate', async (req, res) => {
+  let transactionId;
+  let reference;
+
   try {
-    const { buyer_id, seller_id, amount } = req.body || {};
+    if (!SANDBOX_MODE) {
+      return res.status(403).json({
+        error: 'Payment initialization is disabled outside sandbox mode.',
+      });
+    }
+
+    const secretKey = process.env.PAYSTACK_SECRET_KEY;
+
+    if (!secretKey || !secretKey.startsWith('sk_test_')) {
+      return res.status(503).json({
+        error: 'A Paystack test secret key must be configured.',
+      });
+    }
+
+    const { buyer_id, seller_id, amount, email } = req.body || {};
 
     const buyerId = Number(buyer_id);
     const sellerId = Number(seller_id);
     const numericAmount = Number(amount);
+    const emailAddress =
+      typeof email === 'string' ? email.trim().toLowerCase() : '';
+
+    const amountKobo = Math.round(numericAmount * 100);
 
     if (
-      !Number.isInteger(buyerId) ||
+      !Number.isSafeInteger(buyerId) ||
       buyerId <= 0 ||
-      !Number.isInteger(sellerId) ||
+      !Number.isSafeInteger(sellerId) ||
       sellerId <= 0 ||
+      buyerId === sellerId ||
       !Number.isFinite(numericAmount) ||
-      numericAmount <= 0
+      numericAmount <= 0 ||
+      !Number.isSafeInteger(amountKobo) ||
+      amountKobo <= 0 ||
+      Math.abs(numericAmount * 100 - amountKobo) > 0.000001 ||
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailAddress)
     ) {
       return res.status(400).json({
-        error: 'Valid buyer_id, seller_id, and positive amount are required',
+        error: 'Provide valid buyer_id, seller_id, amount, and email. Amount must be in naira with at most two decimal places.',
       });
     }
 
-    // Generate a four-digit delivery PIN.
+    const usersResult = await pool.query(
+      `SELECT id
+         FROM users
+        WHERE id = ANY($1::integer[])`,
+      [[buyerId, sellerId]]
+    );
+
+    if (usersResult.rowCount !== 2) {
+      return res.status(400).json({
+        error: 'Both buyer and seller must exist in the users table.',
+      });
+    }
+
     const deliveryPin = String(crypto.randomInt(1000, 10000));
 
-    const result = await pool.query(
-      `INSERT INTO transactions
-        (
+    const created = await pool.query(
+      `INSERT INTO transactions (
           buyer_id,
           seller_id,
           amount,
           escrow_status,
           delivery_pin,
           automated_release_at,
-          created_at
-        )
-       VALUES ($1, $2, $3, 'PENDING', $4, NULL, NOW())
-       RETURNING
-          id,
-          buyer_id,
-          seller_id,
-          amount,
-          escrow_status,
-          automated_release_at,
-          created_at`,
-      [buyerId, sellerId, numericAmount, deliveryPin]
+          created_at,
+          updated_at,
+          delivery_pin_attempts
+       )
+       VALUES ($1, $2, $3, 'PENDING', $4, NULL, NOW(), NOW(), 0)
+       RETURNING id, buyer_id, seller_id, amount, escrow_status, created_at`,
+      [buyerId, sellerId, amountKobo / 100, deliveryPin]
     );
 
-    const response = {
-      message: 'Transaction created in demo mode. Payment is not yet confirmed.',
-      transaction: result.rows[0],
-    };
+    transactionId = created.rows[0].id;
 
-    // Only expose the PIN when explicitly running in sandbox mode.
-    if (process.env.ESCRO_SANDBOX_MODE === 'true') {
-      response.delivery_pin = deliveryPin;
+    reference =
+      `ESCRO-${transactionId}-${crypto.randomBytes(8).toString('hex')}`;
+
+    await pool.query(
+      `UPDATE transactions
+          SET paystack_reference = $1,
+              updated_at = NOW()
+        WHERE id = $2`,
+      [reference, transactionId]
+    );
+
+    let paystackResponse;
+
+    try {
+      paystackResponse = await axios.post(
+        'https://api.paystack.co/transaction/initialize',
+        {
+          email: emailAddress,
+          amount: String(amountKobo),
+          currency: 'NGN',
+          reference,
+          metadata: {
+            transaction_id: transactionId,
+            service: 'Escro',
+          },
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${secretKey}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 20000,
+        }
+      );
+    } catch (error) {
+      // Preserve PENDING and the reference because a network timeout
+      // does not prove that Paystack failed to initialize checkout.
+      console.error(
+        '[Paystack] Initialization request failed:',
+        error.response?.data?.message || error.message
+      );
+
+      return res.status(502).json({
+        error: 'Checkout initialization could not be confirmed. Check the transaction before retrying.',
+        transaction_id: transactionId,
+        reference,
+      });
     }
 
-    return res.status(201).json(response);
+    const paymentData = paystackResponse.data?.data;
+
+    if (
+      paystackResponse.data?.status !== true ||
+      !paymentData?.authorization_url ||
+      paymentData.reference !== reference
+    ) {
+      console.error('[Paystack] Invalid initialization response.');
+
+      return res.status(502).json({
+        error: 'Paystack did not return a valid checkout response.',
+        transaction_id: transactionId,
+        reference,
+      });
+    }
+
+    console.log(
+      `[Paystack] Checkout initialized for transaction ${transactionId}.`
+    );
+
+    return res.status(201).json({
+      message: 'Sandbox checkout initialized. Payment is not yet confirmed.',
+      transaction: {
+        ...created.rows[0],
+        paystack_reference: reference,
+      },
+      payment_url: paymentData.authorization_url,
+      reference,
+      delivery_pin: deliveryPin,
+    });
   } catch (error) {
-    console.error('[Transactions] Initiation failed:', error.message);
+    console.error(
+      '[Transactions] Initiation failed:',
+      error.response?.data?.message || error.message
+    );
 
     return res.status(500).json({
-      error: 'Could not initiate transaction',
+      error: 'Could not initiate transaction.',
+      ...(transactionId ? { transaction_id: transactionId } : {}),
     });
   }
 });
 
-// Instagram webhook verification
+// --------------------------------------------------
+// INSTAGRAM WEBHOOK VERIFICATION
+// --------------------------------------------------
+
 app.get('/api/webhook/instagram', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -138,13 +263,16 @@ app.get('/api/webhook/instagram', (req, res) => {
   return res.sendStatus(403);
 });
 
-// Collect Instagram message events from supported webhook structures.
+// --------------------------------------------------
+// INSTAGRAM MESSAGE EVENT NORMALIZATION
+// --------------------------------------------------
+
 function collectInstagramMessageEvents(entry) {
   const events = [];
 
   if (Array.isArray(entry.messaging)) {
     for (const event of entry.messaging) {
-      if (event && event.message) {
+      if (event?.message) {
         events.push(event);
       }
     }
@@ -184,15 +312,106 @@ function collectInstagramMessageEvents(entry) {
   return events;
 }
 
-// Process a verification command.
+// --------------------------------------------------
+// DELIVERY PIN VERIFICATION HELPER
+// --------------------------------------------------
+
+async function verifyDeliveryPin(transactionId, suppliedPin) {
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const result = await client.query(
+      `SELECT id, escrow_status, delivery_pin,
+              delivery_pin_attempts, delivery_pin_locked_until
+         FROM transactions
+        WHERE id = $1
+        FOR UPDATE`,
+      [transactionId]
+    );
+
+    if (result.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return { ok: false, reason: 'NOT_FOUND' };
+    }
+
+    const transaction = result.rows[0];
+
+    if (transaction.escrow_status !== 'FUNDS_HELD') {
+      await client.query('ROLLBACK');
+      return { ok: false, reason: 'INVALID_STATUS' };
+    }
+
+    if (
+      transaction.delivery_pin_locked_until &&
+      new Date(transaction.delivery_pin_locked_until) > new Date()
+    ) {
+      await client.query('ROLLBACK');
+      return { ok: false, reason: 'LOCKED' };
+    }
+
+    if (String(transaction.delivery_pin) !== String(suppliedPin)) {
+      const attempts = Number(transaction.delivery_pin_attempts || 0) + 1;
+      const lockUntil = attempts >= PIN_MAX_ATTEMPTS
+        ? new Date(Date.now() + PIN_LOCK_MINUTES * 60 * 1000)
+        : null;
+
+      await client.query(
+        `UPDATE transactions
+            SET delivery_pin_attempts = $2,
+                delivery_pin_locked_until = $3,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [transactionId, attempts, lockUntil]
+      );
+
+      await client.query('COMMIT');
+
+      return {
+        ok: false,
+        reason: lockUntil ? 'LOCKED' : 'INCORRECT_PIN',
+      };
+    }
+
+    const updated = await client.query(
+      `UPDATE transactions
+          SET escrow_status = 'DELIVERY_CONFIRMED',
+              delivery_confirmed_at = NOW(),
+              delivery_pin_locked_until = NULL,
+              updated_at = NOW()
+        WHERE id = $1
+          AND escrow_status = 'FUNDS_HELD'
+      RETURNING id, escrow_status, delivery_confirmed_at`,
+      [transactionId]
+    );
+
+    await client.query('COMMIT');
+
+    if (updated.rowCount !== 1) {
+      return { ok: false, reason: 'INVALID_STATUS' };
+    }
+
+    return { ok: true, transaction: updated.rows[0] };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// --------------------------------------------------
+// PROCESS INSTAGRAM VERIFICATION COMMAND
 // Example: verify 5 4169
+// --------------------------------------------------
+
 async function processInstagramMessage(event) {
-  if (!event || !event.message || event.message.is_echo) {
+  if (!event?.message || event.message.is_echo) {
     return;
   }
 
   const senderId = event.sender?.id;
-
   const rawText =
     typeof event.message.text === 'string'
       ? event.message.text.trim()
@@ -204,74 +423,44 @@ async function processInstagramMessage(event) {
 
   console.log(`[Instagram] Incoming message from sender ${senderId}`);
 
-  // Correct regular expression.
-  // Matches: verify 5 4169
   const match = rawText.match(/^verify\s+(\d+)\s+(\d{4})$/i);
 
   if (!match) {
-    console.log(
-      '[Instagram] Message does not match: verify <transaction_id> <4-digit PIN>'
-    );
+    console.log('[Instagram] Message is not a verification command.');
     return;
   }
 
-  const transactionId = match[1];
+  // IMPORTANT:
+  // This verifies the PIN but does not yet associate the Instagram
+  // sender with a trusted buyer, seller, or courier account.
+  // Do not use this as production authorization.
+  const transactionId = Number(match[1]);
   const suppliedPin = match[2];
 
-  const transactionResult = await pool.query(
-    `SELECT id, escrow_status, delivery_pin
-       FROM transactions
-      WHERE id::text = $1
-      LIMIT 1`,
-    [transactionId]
-  );
-
-  if (transactionResult.rowCount === 0) {
-    console.log(`[Instagram] Transaction ${transactionId} not found.`);
+  if (!Number.isSafeInteger(transactionId) || transactionId <= 0) {
     return;
   }
 
-  const transaction = transactionResult.rows[0];
+  const result = await verifyDeliveryPin(transactionId, suppliedPin);
 
-  if (transaction.escrow_status !== 'FUNDS_HELD') {
+  if (result.ok) {
     console.log(
-      `[Instagram] Transaction ${transactionId} is ${transaction.escrow_status}; expected FUNDS_HELD.`
+      `[Instagram] Delivery confirmed for transaction ${transactionId}. No payout initiated.`
     );
-    return;
-  }
-
-  if (String(transaction.delivery_pin) !== suppliedPin) {
+  } else {
     console.log(
-      `[Instagram] Incorrect delivery PIN for transaction ${transactionId}.`
-    );
-    return;
-  }
-
-  // Records delivery confirmation only.
-  // It does not transfer money or pay out the seller.
-  const updateResult = await pool.query(
-    `UPDATE transactions
-        SET escrow_status = 'DELIVERY_CONFIRMED'
-      WHERE id::text = $1
-        AND escrow_status = 'FUNDS_HELD'
-        AND delivery_pin::text = $2
-      RETURNING id, escrow_status`,
-    [transactionId, suppliedPin]
-  );
-
-  if (updateResult.rowCount === 1) {
-    console.log(
-      `[Instagram] Transaction ${transactionId} delivery confirmed. No payout was initiated.`
+      `[Instagram] Verification unsuccessful for transaction ${transactionId}: ${result.reason}`
     );
   }
 }
 
-// Instagram webhook receiver
+// --------------------------------------------------
+// INSTAGRAM WEBHOOK RECEIVER
+// --------------------------------------------------
+
 app.post('/api/webhook/instagram', async (req, res) => {
   try {
     const body = req.body;
-
-    console.log('[Instagram Webhook] POST received.');
 
     if (
       body?.object !== 'instagram' ||
@@ -284,38 +473,43 @@ app.post('/api/webhook/instagram', async (req, res) => {
     for (const entry of body.entry) {
       const events = collectInstagramMessageEvents(entry);
 
-      console.log(
-        `[Instagram] Message events found: ${events.length}`
-      );
+      console.log(`[Instagram] Message events found: ${events.length}`);
 
       for (const event of events) {
-        await processInstagramMessage(event);
+        try {
+          await processInstagramMessage(event);
+        } catch (error) {
+          console.error(
+            '[Instagram] Message processing failed:',
+            error.message
+          );
+        }
       }
     }
 
     return res.status(200).send('EVENT_RECEIVED');
   } catch (error) {
     console.error('[Instagram] Webhook handler failed:', error.message);
-
     return res.status(500).send('Webhook handler error');
   }
 });
 
-// Paystack webhook.
-// Verifies the webhook signature and checks the transaction amount
-// and currency before changing PENDING to FUNDS_HELD.
+// --------------------------------------------------
+// PAYSTACK WEBHOOK
+// Verifies signature, reference, amount, currency and status.
+// --------------------------------------------------
+
 app.post('/api/payment/webhook', async (req, res) => {
   try {
     const secretKey = process.env.PAYSTACK_SECRET_KEY;
     const signature = req.get('x-paystack-signature');
 
     if (!secretKey) {
-      console.error('[Paystack] PAYSTACK_SECRET_KEY is not configured.');
+      console.error('[Paystack] Secret key is not configured.');
       return res.status(500).send('Payment webhook is not configured');
     }
 
     if (!signature || !req.rawBody) {
-      console.warn('[Paystack] Missing signature or request body.');
       return res.sendStatus(401);
     }
 
@@ -337,146 +531,172 @@ app.post('/api/payment/webhook', async (req, res) => {
 
     const event = req.body;
 
-    if (
-      event?.event !== 'charge.success' ||
-      event?.data?.status !== 'success'
-    ) {
+    if (event?.event !== 'charge.success') {
       return res.status(200).send('EVENT_RECEIVED');
     }
 
-    const transactionId = event.data.metadata?.transaction_id;
-    const amountKobo = Number(event.data.amount);
-    const currency = event.data.currency;
+    const data = event.data;
+    const reference = data?.reference;
+    const transactionId = data?.metadata?.transaction_id;
+    const amountKobo = Number(data?.amount);
+    const currency = data?.currency;
 
     if (
+      data?.status !== 'success' ||
+      typeof reference !== 'string' ||
+      !reference ||
       !transactionId ||
-      !Number.isFinite(amountKobo) ||
+      !Number.isSafeInteger(Number(transactionId)) ||
+      !Number.isSafeInteger(amountKobo) ||
+      amountKobo <= 0 ||
       currency !== 'NGN'
     ) {
-      console.warn('[Paystack] Invalid payment metadata, amount, or currency.');
+      console.warn('[Paystack] Invalid payment event fields.');
       return res.status(400).send('Invalid payment event');
     }
 
-    const result = await pool.query(
-      `SELECT id, amount, escrow_status
-         FROM transactions
-        WHERE id::text = $1
-        LIMIT 1`,
-      [String(transactionId)]
-    );
+    const client = await pool.connect();
 
-    if (result.rowCount === 0) {
-      console.warn(`[Paystack] Transaction ${transactionId} not found.`);
-      return res.status(404).send('Transaction not found');
-    }
+    try {
+      await client.query('BEGIN');
 
-    const transaction = result.rows[0];
-    const expectedKobo = Math.round(Number(transaction.amount) * 100);
-
-    if (amountKobo !== expectedKobo) {
-      console.warn(`[Paystack] Amount mismatch for transaction ${transactionId}.`);
-      return res.status(400).send('Payment amount mismatch');
-    }
-
-    if (transaction.escrow_status === 'FUNDS_HELD') {
-      return res.status(200).send('EVENT_RECEIVED');
-    }
-
-    if (transaction.escrow_status !== 'PENDING') {
-      console.warn(
-        `[Paystack] Transaction ${transactionId} has status ${transaction.escrow_status}.`
+      const result = await client.query(
+        `SELECT id, amount, escrow_status, paystack_reference
+           FROM transactions
+          WHERE id = $1
+          FOR UPDATE`,
+        [Number(transactionId)]
       );
+
+      if (result.rowCount === 0) {
+        await client.query('ROLLBACK');
+        console.warn('[Paystack] Transaction not found.');
+        return res.status(404).send('Transaction not found');
+      }
+
+      const transaction = result.rows[0];
+
+      if (transaction.paystack_reference !== reference) {
+        await client.query('ROLLBACK');
+        console.warn('[Paystack] Reference mismatch.');
+        return res.status(400).send('Payment reference mismatch');
+      }
+
+      const expectedKobo = Math.round(Number(transaction.amount) * 100);
+
+      if (amountKobo !== expectedKobo) {
+        await client.query('ROLLBACK');
+        console.warn('[Paystack] Amount mismatch.');
+        return res.status(400).send('Payment amount mismatch');
+      }
+
+      if (transaction.escrow_status === 'FUNDS_HELD') {
+        await client.query('COMMIT');
+        return res.status(200).send('EVENT_RECEIVED');
+      }
+
+      if (transaction.escrow_status !== 'PENDING') {
+        await client.query('ROLLBACK');
+        console.warn(
+          `[Paystack] Cannot confirm transaction in status ${transaction.escrow_status}.`
+        );
+        return res.status(200).send('EVENT_RECEIVED');
+      }
+
+      await client.query(
+        `UPDATE transactions
+            SET escrow_status = 'FUNDS_HELD',
+                payment_confirmed_at = NOW(),
+                automated_release_at =
+                  NOW() + ($2 * INTERVAL '1 hour'),
+                updated_at = NOW()
+          WHERE id = $1
+            AND escrow_status = 'PENDING'`,
+        [transaction.id, RELEASE_HOURS]
+      );
+
+      await client.query('COMMIT');
+
+      console.log(
+        `[Paystack] Payment confirmed for transaction ${transaction.id}. Release deadline scheduled for review.`
+      );
+
       return res.status(200).send('EVENT_RECEIVED');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      client.release();
     }
-
-    await pool.query(
-      `UPDATE transactions
-          SET escrow_status = 'FUNDS_HELD'
-        WHERE id::text = $1
-          AND escrow_status = 'PENDING'`,
-      [String(transactionId)]
-    );
-
-    console.log(
-      `[Paystack] Payment verified for transaction ${transactionId}.`
-    );
-
-    return res.status(200).send('EVENT_RECEIVED');
   } catch (error) {
-    console.error('[Paystack] Webhook handler failed:', error.message);
-
+    console.error('[Paystack] Webhook failed:', error.message);
     return res.status(500).send('Webhook handler error');
   }
 });
 
-// Manual delivery PIN verification endpoint.
-// This records delivery confirmation, not payment release.
-app.post('/api/transactions/verify-pin', async (req, res) => {
-  try {
-    const { transaction_id, pin } = req.body || {};
+// --------------------------------------------------
+// MANUAL PIN ENDPOINT
+// Disabled until proper user/courier authentication exists.
+// --------------------------------------------------
 
-    if (
-      !transaction_id ||
-      !/^\d{4}$/.test(String(pin || ''))
-    ) {
-      return res.status(400).json({
-        error: 'transaction_id and a four-digit PIN are required',
-      });
-    }
-
-    const result = await pool.query(
-      `UPDATE transactions
-          SET escrow_status = 'DELIVERY_CONFIRMED'
-        WHERE id::text = $1
-          AND delivery_pin::text = $2
-          AND escrow_status = 'FUNDS_HELD'
-      RETURNING id, escrow_status`,
-      [String(transaction_id), String(pin)]
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(400).json({
-        error: 'Transaction not found, PIN incorrect, or funds are not held',
-      });
-    }
-
-    return res.status(200).json({
-      message: 'Delivery PIN verified. No payout was initiated.',
-      transaction: result.rows[0],
-    });
-  } catch (error) {
-    console.error('[Transactions] PIN verification failed:', error.message);
-
-    return res.status(500).json({
-      error: 'Could not verify transaction PIN',
-    });
-  }
+app.post('/api/transactions/verify-pin', (req, res) => {
+  return res.status(403).json({
+    error: 'Manual PIN verification is disabled until authenticated buyer, seller, or courier access is implemented.',
+  });
 });
 
-// Scheduled safety check.
-// This deliberately does not automatically release funds.
+// --------------------------------------------------
+// RELEASE DEADLINE MONITOR
+// This does not automatically transfer money.
+// --------------------------------------------------
+
 cron.schedule('0 * * * *', async () => {
   try {
     const result = await pool.query(
-      `SELECT id
+      `SELECT id, escrow_status, automated_release_at, dispute_status
          FROM transactions
-        WHERE escrow_status = 'FUNDS_HELD'
+        WHERE escrow_status IN ('FUNDS_HELD', 'DELIVERY_CONFIRMED')
           AND automated_release_at IS NOT NULL
-          AND automated_release_at <= NOW()`
+          AND automated_release_at <= NOW()
+          AND dispute_status = 'NONE'
+        ORDER BY automated_release_at ASC`
     );
 
     if (result.rowCount > 0) {
       console.warn(
-        `[Cron] ${result.rowCount} transaction(s) reached their release deadline. Review them manually. No funds were released.`
+        `[Cron] ${result.rowCount} transaction(s) have reached their release-review deadline. No funds were released.`
       );
+
+      for (const transaction of result.rows) {
+        console.warn(
+          `[Cron] Review transaction ${transaction.id}, status ${transaction.escrow_status}.`
+        );
+      }
     }
   } catch (error) {
-    console.error(
-      '[Cron] Expired transaction check failed:',
-      error.message
-    );
+    console.error('[Cron] Release deadline check failed:', error.message);
   }
 });
+
+// --------------------------------------------------
+// GLOBAL ERROR HANDLER
+// --------------------------------------------------
+
+app.use((error, req, res, next) => {
+  console.error('[Server] Unhandled request error:', error.message);
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return res.status(500).json({
+    error: 'An unexpected server error occurred.',
+  });
+});
+
+// --------------------------------------------------
+// START SERVER
+// --------------------------------------------------
 
 app.listen(PORT, () => {
   console.log(`Escro server listening on port ${PORT}`);
